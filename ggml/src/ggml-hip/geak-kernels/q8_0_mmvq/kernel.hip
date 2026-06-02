@@ -1,6 +1,19 @@
 #include "../geak_common_hip.cuh"
 
-static __global__ void geak_q8_0_mmvq_kernel(
+static_assert(QK8_0 == QK8_1, "q8_0 and q8_1 block sizes must match");
+
+static __device__ __forceinline__ int geak_q8_0_q8_1_dot_i32(
+        const block_q8_0 & xb,
+        const block_q8_1 & yb) {
+    int acc = 0;
+#pragma unroll
+    for (int j = 0; j < QK8_0; ++j) {
+        acc += int(xb.qs[j]) * int(yb.qs[j]);
+    }
+    return acc;
+}
+
+static __global__ __launch_bounds__(256) void geak_q8_0_mmvq_kernel(
         const block_q8_0 * __restrict__ x,
         const block_q8_1 * __restrict__ y,
         float * __restrict__ out,
@@ -16,12 +29,15 @@ static __global__ void geak_q8_0_mmvq_kernel(
 
     const int xb = k / QK8_0;
     const int yb = k / QK8_1;
-    const block_q8_0 * xrow = x + row * xb;
-    const block_q8_1 * ycol = y + col * yb;
+    const block_q8_0 * __restrict__ xrow = x + row * xb;
+    const block_q8_1 * __restrict__ ycol = y + col * yb;
 
     float sum = 0.0f;
-    for (int i = tid; i < k; i += blockDim.x) {
-        sum += geak_q8_0_value(xrow[i / QK8_0], i % QK8_0) * geak_q8_1_value(ycol, i);
+    for (int ib = tid; ib < xb; ib += blockDim.x) {
+        const block_q8_0 & xbq = xrow[ib];
+        const block_q8_1 & ybq = ycol[ib];
+        const int dot = geak_q8_0_q8_1_dot_i32(xbq, ybq);
+        sum += (geak_h2f(xbq.d) * geak_h2f(GEAK_Q8_1_D(ybq))) * float(dot);
     }
 
     __shared__ float scratch[256];

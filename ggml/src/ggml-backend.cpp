@@ -761,6 +761,22 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+static size_t ggml_backend_sched_max_host_weight_op_offload(void) {
+    // Maximum host-backed weight bytes that may still trigger generic op offload.
+    const char * env = getenv("GGML_OP_OFFLOAD_MAX_HOST_WEIGHT_BYTES");
+    if (env == NULL) {
+        return 0;
+    }
+
+    char * end = NULL;
+    unsigned long long value = strtoull(env, &end, 10);
+    if (end == env) {
+        return 0;
+    }
+
+    return (size_t) value;
+}
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -817,6 +833,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    size_t max_host_weight_op_offload;
 
     int debug;
 
@@ -913,10 +930,14 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         }
         // skip ROPE since the rope freqs tensor is too small to choose a backend based on it
         // not an ideal solution
-        if (tensor->op != GGML_OP_ROPE && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        ggml_backend_buffer_t src_buffer = src->view_src ? src->view_src->buffer : src->buffer;
+        if (tensor->op != GGML_OP_ROPE && src_buffer != NULL && ggml_backend_buffer_get_usage(src_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
             // check if a backend with higher prio wants to offload the op
-            if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+            if (sched->op_offload &&
+                    src_backend_id == sched->n_backends - 1 &&
+                    ggml_backend_buffer_is_host(src_buffer) &&
+                    ggml_nbytes(src) <= sched->max_host_weight_op_offload) {
                 for (int b = 0; b < src_backend_id; b++) {
                     if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                         SET_CAUSE(tensor, "1.off");
@@ -1787,6 +1808,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+    sched->max_host_weight_op_offload = ggml_backend_sched_max_host_weight_op_offload();
 
     ggml_backend_sched_reset(sched);
 

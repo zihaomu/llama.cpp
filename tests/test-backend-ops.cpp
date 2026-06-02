@@ -4996,6 +4996,209 @@ struct test_rope : public test_case {
     }
 };
 
+// GGML_OP_DSV4_ROPE_TAIL
+struct test_dsv4_rope_tail : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne_a;
+    int n_dims;
+    int mode;
+    int n_ctx;
+    float fs;
+    float ef;
+    float af;
+    bool ff;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type, ne_a, n_dims, mode, n_ctx, fs, ef, af, ff);
+    }
+
+    test_dsv4_rope_tail(
+            ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne_a = {80, 4, 3, 1},
+            int n_dims = 32,
+            int mode = GGML_ROPE_TYPE_NORMAL,
+            int n_ctx = 512,
+            float fs = 1.0f,
+            float ef = 0.0f,
+            float af = 1.0f,
+            bool ff = false)
+        : type(type), ne_a(ne_a), n_dims(n_dims), mode(mode), n_ctx(n_ctx), fs(fs), ef(ef), af(af), ff(ff) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne_a[2]);
+        ggml_set_name(pos, "pos");
+
+        ggml_tensor * freq = nullptr;
+        if (ff) {
+            freq = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_dims/2);
+            ggml_set_name(freq, "freq");
+        }
+
+        ggml_tensor * out = ggml_dsv4_rope_tail(
+            ctx, a, pos, freq, n_dims, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f, false);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int> data(ne_a[2]);
+                for (int i = 0; i < ne_a[2]; i++) {
+                    data[i] = rand() % n_ctx;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else if (t->type == GGML_TYPE_F32 && t->ne[0] == n_dims/2 && ggml_is_vector(t)) {
+                init_tensor_uniform(t, 0.9f, 1.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_maa_err() override {
+        return 1e-3;
+    }
+};
+
+// GGML_OP_DSV4_FP8_KV_QUANTIZE
+struct test_dsv4_fp8_kv_quantize : public test_case {
+    const std::array<int64_t, 4> ne_a;
+    int n_rot;
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne_a, n_rot);
+    }
+
+    test_dsv4_fp8_kv_quantize(
+            std::array<int64_t, 4> ne_a = {96, 4, 3, 1},
+            int n_rot = 32)
+        : ne_a(ne_a), n_rot(n_rot) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_dsv4_fp8_kv_quantize(ctx, a, n_rot);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+    }
+
+    double max_maa_err() override {
+        return 1e-3;
+    }
+};
+
+// GGML_OP_DSV4_HC_SPLIT_SINKHORN
+struct test_dsv4_hc_split_sinkhorn : public test_case {
+    int n_hc;
+    int n_tokens;
+    int sinkhorn_iters;
+    float eps;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_hc, n_tokens, sinkhorn_iters, eps);
+    }
+
+    test_dsv4_hc_split_sinkhorn(
+            int n_hc = 4,
+            int n_tokens = 3,
+            int sinkhorn_iters = 2,
+            float eps = 1.0e-6f)
+        : n_hc(n_hc), n_tokens(n_tokens), sinkhorn_iters(sinkhorn_iters), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t mix_hc = (2 + n_hc)*n_hc;
+
+        ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, mix_hc, n_tokens);
+        ggml_set_name(mixes, "mixes");
+
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, mix_hc);
+        ggml_set_name(base, "base");
+
+        ggml_tensor * out = ggml_dsv4_hc_split_sinkhorn(ctx, mixes, scale, base, n_hc, sinkhorn_iters, eps);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "scale") == 0) {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else if (strcmp(t->name, "base") == 0) {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            } else {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            }
+        }
+    }
+
+    double max_maa_err() override {
+        return 1e-4;
+    }
+};
+
+// GGML_OP_DSV4_HC_EXPAND
+struct test_dsv4_hc_expand : public test_case {
+    int64_t n_embd;
+    int64_t n_hc;
+    int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_hc, n_tokens);
+    }
+
+    test_dsv4_hc_expand(
+            int64_t n_embd = 32,
+            int64_t n_hc = 4,
+            int64_t n_tokens = 3)
+        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * block_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(block_out, "block_out");
+
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc, n_tokens);
+        ggml_set_name(post, "post");
+
+        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_hc, n_hc, n_tokens);
+        ggml_set_name(comb, "comb");
+
+        ggml_tensor * out = ggml_dsv4_hc_expand(ctx, block_out, residual, post, comb);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -0.5f, 0.5f);
+        }
+    }
+
+    double max_maa_err() override {
+        return 1e-4;
+    }
+};
+
 // GGML_OP_POOL2D
 struct test_pool2d : public test_case {
     enum ggml_op_pool pool_type;
@@ -8792,6 +8995,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int mode : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX}) {
+            for (bool ff : {false, true}) {
+                test_cases.emplace_back(new test_dsv4_rope_tail(type, {80, 4, 3, 1}, 32, mode, 512, 1.0f, 0.0f, 1.0f, ff));
+                test_cases.emplace_back(new test_dsv4_rope_tail(type, {128, 2, 5, 1}, 64, mode, 2048, 1.4245f, 0.7465f, 1.4245f, ff));
+            }
+        }
+    }
+
+    test_cases.emplace_back(new test_dsv4_fp8_kv_quantize({64, 4, 3, 1}, 0));
+    test_cases.emplace_back(new test_dsv4_fp8_kv_quantize({96, 4, 3, 1}, 32));
+    test_cases.emplace_back(new test_dsv4_fp8_kv_quantize({128, 2, 5, 1}, 64));
+    test_cases.emplace_back(new test_dsv4_fp8_kv_quantize({192, 2, 5, 1}, 64));
+
+    test_cases.emplace_back(new test_dsv4_hc_split_sinkhorn(2, 1, 1, 1.0e-6f));
+    test_cases.emplace_back(new test_dsv4_hc_split_sinkhorn(4, 3, 2, 1.0e-6f));
+    test_cases.emplace_back(new test_dsv4_hc_split_sinkhorn(8, 2, 4, 1.0e-6f));
+    test_cases.emplace_back(new test_dsv4_hc_split_sinkhorn(16, 2, 2, 1.0e-6f));
+
+    test_cases.emplace_back(new test_dsv4_hc_expand(16, 2, 1));
+    test_cases.emplace_back(new test_dsv4_hc_expand(32, 4, 3));
+    test_cases.emplace_back(new test_dsv4_hc_expand(64, 8, 2));
+    test_cases.emplace_back(new test_dsv4_hc_expand(96, 16, 2));
 
     for (int v : { 0, 1, 2, 3 }) {
         for (int dim : { 0, 1, 2, 3, }) {

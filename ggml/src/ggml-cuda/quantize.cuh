@@ -39,3 +39,5 @@ void quantize_mmq_fp4_cuda(const float *   x,
                              int64_t         ne2,
                              int64_t         ne3,
                              cudaStream_t    stream);
+
+void ggml_cuda_op_dsv4_fp8_kv_quantize(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

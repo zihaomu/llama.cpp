@@ -22,8 +22,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -34,6 +36,32 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+static int llama_env_int_clamped(const char * name, int min_value, int max_value) {
+    const char * env = getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return min_value;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = strtol(env, &end, 10);
+    if (end == env || *end != '\0' || errno == ERANGE) {
+        LLAMA_LOG_WARN("%s: ignoring invalid %s=%s\n", __func__, name, env);
+        return min_value;
+    }
+
+    if (value < min_value) {
+        return min_value;
+    }
+
+    if (value > max_value) {
+        LLAMA_LOG_WARN("%s: clamping %s=%ld to %d\n", __func__, name, value, max_value);
+        return max_value;
+    }
+
+    return (int) value;
+}
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -175,6 +203,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_deepseek2ocr(params);
         case LLM_ARCH_DEEPSEEK32:
             return new llama_model_deepseek32(params);
+        case LLM_ARCH_DEEPSEEK4:
+            return new llama_model_deepseek4(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
         case LLM_ARCH_MISTRAL4:
@@ -1225,10 +1255,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] /= split_sum;
     }
 
+    const int dsv4_front_prefix_layers_env =
+        llama_env_int_clamped("LLAMA_DSV4_FRONT_PREFIX_LAYERS", 0, n_layer);
+    const bool dsv4_front_prefix_enabled =
+        arch == LLM_ARCH_DEEPSEEK4 && !devices.empty() && dsv4_front_prefix_layers_env > 0;
+    const int dsv4_front_prefix_layers = dsv4_front_prefix_enabled ? dsv4_front_prefix_layers_env : 0;
+    ggml_backend_dev_t dsv4_front_prefix_dev = dsv4_front_prefix_enabled ? devices.front().dev : nullptr;
+
+    if (dsv4_front_prefix_layers_env > 0 && arch != LLM_ARCH_DEEPSEEK4) {
+        LLAMA_LOG_WARN("%s: ignoring LLAMA_DSV4_FRONT_PREFIX_LAYERS for non-DeepSeek4 arch %s\n",
+                __func__, arch_name().c_str());
+    } else if (dsv4_front_prefix_layers_env > 0 && devices.empty()) {
+        LLAMA_LOG_WARN("%s: ignoring LLAMA_DSV4_FRONT_PREFIX_LAYERS because no accelerator devices are available\n",
+                __func__);
+    } else if (dsv4_front_prefix_enabled) {
+        LLAMA_LOG_INFO("%s: DeepSeek4 front-prefix placement enabled: first %d layers assigned to %s\n",
+                __func__, dsv4_front_prefix_layers, ggml_backend_dev_name(dsv4_front_prefix_dev));
+    }
+
     const int i_gpu_start = std::max(int(hparams.n_layer) + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, int(n_layer) + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < int(hparams.n_layer) && hparams.is_swa(il);
+        if (il < dsv4_front_prefix_layers) {
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s by DeepSeek4 front-prefix placement, is_swa = %d\n",
+                    il, ggml_backend_dev_name(dsv4_front_prefix_dev), is_swa);
+            return {dsv4_front_prefix_dev, &pimpl->gpu_buft_list.at(dsv4_front_prefix_dev)};
+        }
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
@@ -1978,6 +2031,34 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         nullptr,
                         nullptr);
             } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                llama_memory_i::layer_filter_cb filter_attn = [&](int32_t) {
+                    return true;
+                };
+                llama_memory_i::layer_filter_cb filter_recr = [&](int32_t il) {
+                    return hparams.attn_compress_ratio[il] != 0;
+                };
+
+                res = new llama_memory_hybrid_iswa(
+                        /* model             */ *this,
+                        /* attn_type_k       */ params.type_k,
+                        /* attn_type_v       */ params.type_v,
+                        /* attn_v_trans      */ !cparams.flash_attn,
+                        /* attn_swa_full     */ params.swa_full,
+                        /* attn_kv_size      */ cparams.n_ctx_seq,
+                        /* attn_n_ubatch     */ cparams.n_ubatch,
+                        /* attn_n_pad        */ 1,
+                        /* recurrent_type_r  */ GGML_TYPE_F32,
+                        /* recurrent_type_s  */ GGML_TYPE_F32,
+                        /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                        /* n_seq_max         */ cparams.n_seq_max,
+                        /* n_rs_seq          */ cparams.n_rs_seq,
+                        /* offload           */ cparams.offload_kqv,
+                        /* unified           */ cparams.kv_unified,
+                        /* filter_attn       */ std::move(filter_attn),
+                        /* filter_recr       */ std::move(filter_recr));
+            } break;
         // Models that need standard caching should rely on recurrent/hybrid
         // checks
         default:
@@ -2295,6 +2376,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GRANITE:

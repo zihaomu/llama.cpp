@@ -14,6 +14,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -28,6 +29,11 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+static bool llama_env_enabled(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr && strcmp(env, "0") != 0 && strcmp(env, "false") != 0 && strcmp(env, "FALSE") != 0;
 }
 
 llama_context::llama_context(
@@ -421,7 +427,7 @@ void llama_context::sched_reserve() {
 
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs = cparams.n_seq_max;
+    const uint32_t n_seqs = model.arch == LLM_ARCH_DEEPSEEK4 ? 1 : cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
@@ -2208,6 +2214,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        // DeepSeek V4 builds chunked continuation graphs whose temporary tensor
+        // count can exceed the prompt-reserve graph, especially after the
+        // compressed attention cache becomes visible.
+        return std::max<uint32_t>(65536u, n_tokens * 256 + 64u * model.n_tensors());
+    }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
@@ -2345,7 +2357,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer;
         if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && strcmp(name, "norm") == 0) {
+            const bool skip_layer0_norm_pin =
+                model.arch == LLM_ARCH_DEEPSEEK4 &&
+                il == 0 &&
+                llama_env_enabled("LLAMA_DSV4_SKIP_LAYER0_NORM_PIN");
+            if (il != -1 && strcmp(name, "norm") == 0 && !skip_layer0_norm_pin) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {

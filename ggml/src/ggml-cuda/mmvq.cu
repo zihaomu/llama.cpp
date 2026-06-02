@@ -2,8 +2,15 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#if defined(GGML_USE_HIP)
+#include "../ggml-hip/dsv4-native-mmvq.h"
+#endif
 
 #include <cstdint>
+#if defined(GGML_USE_HIP)
+#include <cstdio>
+#include <cstdlib>
+#endif
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -473,6 +480,55 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+#if defined(GGML_USE_HIP)
+static void ggml_hip_dsv4_mmvq_shape_dump(
+        ggml_type type_x, int ncols_x, int nrows_x, int ncols_dst,
+        int nchannels_x, int nchannels_y, int nchannels_dst,
+        int nsamples_x, int nsamples_dst,
+        int stride_row_x, int stride_col_y, int stride_col_dst,
+        int stride_channel_x, int stride_channel_y, int stride_channel_dst,
+        int stride_sample_x, int stride_sample_y, int stride_sample_dst,
+        bool has_ids, bool has_fusion, int cc, int warp_size, int table_id, int nwarps, int rows_per_block,
+        const dim3 & grid, const dim3 & block, bool small_k) {
+    const char * enabled = std::getenv("LLAMA_HIP_DSV4_MMVQ_SHAPE_DUMP");
+    if (enabled == nullptr || enabled[0] == '\0' || enabled[0] == '0') {
+        return;
+    }
+
+    static std::FILE * file = nullptr;
+    static bool header_written = false;
+
+    if (file == nullptr) {
+        const char * path = std::getenv("LLAMA_HIP_DSV4_MMVQ_SHAPE_DUMP_PATH");
+        file = path != nullptr && path[0] != '\0' ? std::fopen(path, "w") : stderr;
+        if (file == nullptr) {
+            file = stderr;
+        }
+    }
+
+    if (!header_written) {
+        std::fprintf(file,
+            "type_x,ncols_x,nrows_x,ncols_dst,nchannels_x,nchannels_y,nchannels_dst,"
+            "nsamples_x,nsamples_dst,stride_row_x,stride_col_y,stride_col_dst,"
+            "stride_channel_x,stride_channel_y,stride_channel_dst,stride_sample_x,"
+            "stride_sample_y,stride_sample_dst,has_ids,has_fusion,cc,warp_size,table_id,nwarps,"
+            "rows_per_block,grid_x,grid_y,grid_z,block_x,block_y,block_z,small_k\n");
+        header_written = true;
+    }
+
+    std::fprintf(file,
+        "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%u,%u,%u,%u,%u,%d\n",
+        static_cast<int>(type_x), ncols_x, nrows_x, ncols_dst,
+        nchannels_x, nchannels_y, nchannels_dst, nsamples_x, nsamples_dst,
+        stride_row_x, stride_col_y, stride_col_dst,
+        stride_channel_x, stride_channel_y, stride_channel_dst,
+        stride_sample_x, stride_sample_y, stride_sample_dst,
+        has_ids ? 1 : 0, has_fusion ? 1 : 0, cc, warp_size, table_id, nwarps, rows_per_block,
+        grid.x, grid.y, grid.z, block.x, block.y, block.z, small_k ? 1 : 0);
+    std::fflush(file);
+}
+#endif
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -885,10 +941,41 @@ static void mul_mat_vec_q_switch_ncols_dst(
             constexpr int c_ncols_dst = 1;
 
             bool use_small_k = should_use_small_k(c_ncols_dst);
+#if defined(GGML_USE_HIP)
+            const auto dump_q8_0_shape = [&](bool small_k, const std::pair<dim3, dim3> & dims) {
+                if constexpr (type == GGML_TYPE_Q8_0) {
+                    const int nwarps_log = calc_nwarps(type, c_ncols_dst, table_id);
+                    const int rows_per_block_log = calc_rows_per_block(c_ncols_dst, table_id, small_k, nwarps_log);
+                    ggml_hip_dsv4_mmvq_shape_dump(type, ncols_x, nrows_x, c_ncols_dst,
+                        nchannels_x, nchannels_y, nchannels_dst, nsamples_x, nsamples_dst,
+                        stride_row_x, stride_col_y, stride_col_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        stride_sample_x, stride_sample_y, stride_sample_dst,
+                        has_ids, has_fusion, cc, warp_size, table_id, nwarps_log, rows_per_block_log,
+                        dims.first, dims.second, small_k);
+                }
+            };
+            if constexpr (type == GGML_TYPE_Q8_0) {
+                if (ggml_hip_dsv4_native_mmvq_q8_0_applicable(has_fusion, ncols_x, c_ncols_dst, nsamples_x, nsamples_dst, warp_size)) {
+                    ggml_hip_dsv4_native_mmvq_q8_0_launch(
+                        vx, vy, ids, dst, ncols_x, nrows_x,
+                        stride_row_x, stride_col_y, stride_col_dst,
+                        nchannels_x, nchannels_y, nchannels_dst,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        nsamples_x, nsamples_dst,
+                        stride_sample_x, stride_sample_y, stride_sample_dst,
+                        stream);
+                    return;
+                }
+            }
+#endif
 
             if (use_small_k) {
                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                         nsamples_dst, warp_size, table_id, true);
+#if defined(GGML_USE_HIP)
+                dump_q8_0_shape(true, dims);
+#endif
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst, true>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
@@ -897,6 +984,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
             } else {
                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                         nsamples_dst, warp_size, table_id);
+#if defined(GGML_USE_HIP)
+                dump_q8_0_shape(false, dims);
+#endif
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
